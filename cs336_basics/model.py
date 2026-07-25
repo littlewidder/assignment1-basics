@@ -54,3 +54,19 @@ class Embedding(torch.nn.Module):
 
     def forward(self, x: torch.Tensor)-> torch.Tensor:
         return self.weight[x]
+
+class RMSNorm(torch.nn.Module):
+    def __init__(self, d_m, eps: float = 1e-5, dtype=None, device=None):
+        super().__init__()
+        self.d_m = d_m
+        self.eps = eps
+        self.dtype=dtype
+        self.device=device
+        self.g = torch.nn.Parameter(torch.ones((d_m), dtype=dtype, device=device))
+
+    def forward(self, x: torch.Tensor)-> torch.Tensor:
+        assert x.shape[-1] == self.d_m, "dim does not match"
+        in_dtype = x.dtype
+        x = x.to(torch.float32)
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (x/rms*self.g).to(in_dtype)
