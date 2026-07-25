@@ -8,7 +8,7 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
-from cs336_basics.model import Linear
+from cs336_basics.model import Linear, Embedding
 
 
 def run_linear(
@@ -54,7 +54,9 @@ def run_embedding(
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
 
-    raise NotImplementedError
+    e = Embedding(vocab_size, d_model)
+    e.load_state_dict({"weight": weights})
+    return e(token_ids)
 
 
 def run_swiglu(

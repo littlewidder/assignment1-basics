@@ -1,3 +1,4 @@
+from numpy import dtypes
 from math import sqrt
 
 import torch
@@ -36,3 +37,20 @@ class Linear(torch.nn.Module):
         ), f"Expected input shape to be ({x.shape[:-1]}, {self.in_features}), but got {x.shape}"
         # return einsum(x, self.weight, "b i, o i -> b o")
         return x @ self.weight.T
+
+
+class Embedding(torch.nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, dtype=None, device=None):
+        super().__init__()
+        self.num_embeddings =  num_embeddings
+        self.embedding_dim = embedding_dim
+        self.dtype = dtype
+        self.device = device
+        self.weight = torch.nn.Parameter(torch.empty((num_embeddings, embedding_dim), dtype=dtype, device=device))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.trunc_normal_(self.weight, mean=0.0, std=1.0, a=-3.0, b=3.0)
+
+    def forward(self, x: torch.Tensor)-> torch.Tensor:
+        return self.weight[x]
