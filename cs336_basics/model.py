@@ -112,3 +112,30 @@ class SwiGLU2(torch.nn.Module):
     def forward(self, x:torch.Tensor) -> torch.Tensor:
         y = self.w1(x)
         return self.w3((y*torch.sigmoid(y))*self.w2(x))
+
+class RoPE(torch.nn.Module):
+    def __init__(self, d_m, theta, max_seq_len, device=None, dtype=None):
+        super().__init__()
+        self.d_m = d_m
+        self.theta = theta
+        self.max_seq_len = max_seq_len
+        self.device = device
+        self.dtype = dtype
+        self.register_buffers(max_seq_len, d_m, theta, device, dtype)
+
+    def register_buffers(self, max_seq_len, d_m, theta, device, dtype):
+        pos = torch.arange(max_seq_len, device=device, dtype=dtype)
+        k = torch.arange(d_m//2, device=device, dtype=dtype)
+        self.thetas = 1/(theta**((2.0*k)/d_m)) # thetas for one vector, one position, all pairs of dimensions
+        self.register_buffer("cos_t", torch.cos(pos.unsqueeze(-1)*self.thetas), persistent=False)
+        self.register_buffer("sin_t", torch.sin(pos.unsqueeze(-1)*self.thetas), persistent = False)
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        assert x.shape[-1] == self.d_m, "input dim does not match"
+        x1 = x[..., 0::2]
+        x2 = x[..., 1::2]
+        # y1 = x1*torch.cos(positions.unsqueeze(-1)*self.thetas) - x2*torch.sin(positions.unsqueeze(-1)*self.thetas)
+        # y2 = x1*torch.sin(positions.unsqueeze(-1)*self.thetas) +x2*torch.cos(positions.unsqueeze(-1)*self.thetas)
+        y1 = x1*self.cos_t[positions] - x2*self.sin_t[positions]
+        y2 = x1*self.sin_t[positions] + x2*self.cos_t[positions]
+        return torch.stack([y1, y2], dim=-1).flatten(-2)
