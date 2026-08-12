@@ -1,3 +1,4 @@
+from typing import Optional
 from numpy import dtypes
 from math import sqrt
 
@@ -139,3 +140,100 @@ class RoPE(torch.nn.Module):
         y1 = x1*self.cos_t[positions] - x2*self.sin_t[positions]
         y2 = x1*self.sin_t[positions] + x2*self.cos_t[positions]
         return torch.stack([y1, y2], dim=-1).flatten(-2)
+
+def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
+    y= x-x.max(dim=dim, keepdim=True)[0]
+    e = torch.exp(y)
+    return e/e.sum(dim=dim, keepdim=True)
+
+class Attention1(torch.nn.Module):
+    def __init__(self, dtype=None, device=None):
+        super().__init__()
+        self.dtype = dtype
+        self.device = device
+
+    def forward(self, k: torch.Tensor, v: torch.Tensor, q: torch.Tensor, mask: Optional[torch.Tensor]):
+        d_k = k.shape[-1]
+        scores = (q@k.mT)/(d_k**0.5)
+        if mask is not None:
+            # add_mask = torch.where(mask, 0.0, float("-inf"))
+            # scores = scores + add_mask
+            scores.masked_fill_(~mask, float("-inf"))
+        return softmax(scores, dim=-1)@v
+
+class MHA(torch.nn.Module):
+    def __init__(self, d_m: int, n_head: int, dtype = None, device=None):
+        super().__init__()
+        self.d_m = d_m
+        self.n_heads = n_head
+        self.Wq = torch.nn.Parameter(torch.empty((d_m, d_m), device=device, dtype=dtype))
+        self.Wk = torch.nn.Parameter(torch.empty((d_m, d_m), device=device, dtype=dtype))
+        self.Wv = torch.nn.Parameter(torch.empty((d_m, d_m), device=device, dtype=dtype))
+        self.Wo = torch.nn.Parameter(torch.empty((d_m, d_m), device=device, dtype=dtype))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        seq = x.shape[-2]
+        d_head = self.d_m//self.n_heads
+        q = (x@self.Wq.mT).unflatten(-1, (self.n_heads, d_head)).transpose(-3, -2)
+        k = (x@self.Wk.mT).unflatten(-1, (self.n_heads, d_head)).transpose(-3, -2)
+        v = (x@self.Wv.mT).unflatten(-1, (self.n_heads, d_head)).transpose(-3, -2)
+        mask = torch.tril(torch.ones(seq, seq, dtype=torch.bool, device=x.device))
+        a = Attention1()(k, v, q, mask)                       # (..., n_head, seq, d_head)
+        a = a.transpose(-3, -2).flatten(-2)                   # (..., seq, d_m)
+        return a@self.Wo.mT
+
+class MHA_full(torch.nn.Module):
+    def __init__(self, d_m, n_head, max_seq_len, theta, dtype = None, device=None):
+        super().__init__()
+        self.d_m = d_m
+        self.d_head = d_m//n_head
+        self.n_head = n_head
+        self.max_seq_leg = max_seq_len
+        self.Lq = Linear(d_m, d_m, dtype, device)
+        self.Lk = Linear(d_m, d_m, dtype, device)
+        self.Lv = Linear(d_m, d_m, dtype, device)
+        self.Lo = Linear(d_m, d_m, dtype, device)
+        self.rope = RoPE(self.d_head, theta, max_seq_len, device, dtype)
+        self.device = device
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        seq = x.shape[-2]
+        q = self.Lq(x).unflatten(-1, (self.n_head, -1)).transpose(-3, -2)
+        v = self.Lv(x).unflatten(-1, (self.n_head, -1)).transpose(-3, -2)
+        k = self.Lk(x).unflatten(-1, (self.n_head, -1)).transpose(-3, -2)
+        mask = torch.tril(torch.ones(seq, seq, dtype=torch.bool, device=self.device))
+        q1 = self.rope(q, positions)
+        k1 = self.rope(k, positions)
+        a = Attention1()(k1, v, q1, mask)
+        return self.Lo(a.transpose(-3, -2).flatten(-2))
+
+class MyTransformer(torch.nn.Module):
+    def __init__(self, d_m, n_head, max_seq_len, theta, d_ff):
+        super().__init__()
+        self.mha = MHA_full(d_m, n_head, max_seq_len, theta)
+        self.norm1 = RMSNorm(d_m)
+        self.ffn = SwiGLU2(d_m, d_ff)
+        self.norm2 = RMSNorm(d_m)
+
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
+        positions = torch.arange(x.shape[-2], device = x.device)
+        y = self.mha(self.norm1(x), positions) + x
+        return y+ self.ffn(self.norm2(y))
+
+class FullTransformer(torch.nn.Module):
+    def __init__(self, vocab_size, layers, context_len, d_m, num_heads, theta, d_ff,  dtype=None, device=None):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([MyTransformer(d_m, num_heads, context_len, theta, d_ff) for i in range(layers)])
+        # for i in range(layers):
+        #     self.layers[i] = MyTransformer(d_m, num_heads, context_len, theta, d_ff)
+        self.embedding = Embedding(vocab_size, d_m)
+        self.norm = RMSNorm(d_m)
+        self.lm_head = Linear(d_m, vocab_size)
+        self.vocab_size = vocab_size
+
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
+        activation = self.embedding(x)
+        for layer in self.layers:
+            activation = layer(activation)
+        activation = self.norm(activation)
+        return self.lm_head(activation)

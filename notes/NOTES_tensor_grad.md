@@ -146,3 +146,138 @@ Complex/named reshaping (split heads, merge pairs)? -> einops.rearrange
 After `transpose`/`permute`, a following `.view(...)` may fail (non-contiguous). Insert
 `.contiguous()` before `.view(...)`, or use `.reshape(...)`. This is why multi-head attention
 code often has `.contiguous()` right before merging the head axis back into `d_model`.
+
+## 10. Reductions & max/argmax
+
+- **Global** (over all elements): `x.max()` -> scalar tensor. `.item()` for a Python number.
+- **Along a dim**: `x.max(dim=d)` returns a NAMED TUPLE `(values, indices)` — unpack it
+  (`vals, idx = x.max(dim=-1)`), index `[0]`/`.values`, or use `x.argmax(dim=d)` for just the
+  position.
+- **`keepdim=True`** keeps the reduced axis as size 1 (e.g. `(...,1)`) so the result broadcasts
+  back against the original — same trick as `mean`/`sum`. Needed for softmax stability:
+  `x - x.max(dim=-1, keepdim=True).values`.
+- Gotcha: `torch.max(a, b)` (two tensors) is ELEMENT-WISE max (like `np.maximum`), different from
+  the reduction `x.max(dim=...)`.
+
+## 11. Transpose / axis reorder
+
+| op | effect | use for |
+|---|---|---|
+| `x.T` | reverse ALL dims (2-D only; deprecated + warns on >2-D) | plain 2-D matrices |
+| `x.mT` | swap LAST TWO dims (batch-safe) | batched matrices |
+| `x.transpose(-2,-1)` | swap last two (explicit) | same as `.mT` |
+| `x.transpose(i,j)` | swap dims i and j | arbitrary two axes |
+| `x.permute(...)` | arbitrary reordering | full control |
+
+- `(2,3,4).T` -> `(4,3,2)` (reverses all); `(2,3,4).mT` -> `(2,4,3)` (swaps last two).
+- Attention scores: `Q @ K.mT` (NOT `K.T`) so only the `d_k` axes contract.
+- `Linear`'s `x @ self.weight.T` is fine because `weight` is exactly 2-D.
+
+## 12. Masking (additive, for softmax/attention)
+
+Add a mask to scores BEFORE softmax. Blocked positions get **-inf** (NOT +inf):
+`exp(-inf)=0` -> weight 0; `+inf` -> NaN.
+
+```python
+# build an additive matrix (0 keep, -inf block)
+add_mask = torch.where(mask, 0.0, float("-inf"));  masked = scores + add_mask
+# or fill directly (idiomatic); ~mask because mask=True means "keep"
+masked = scores.masked_fill(~mask, float("-inf"))
+```
+
+- `torch.where(cond, a, b)` = element-wise pick (a where cond True else b); `mask` broadcasts.
+- `masked_fill(mask, value)` is a Tensor method; writes `value` where mask is True; mask broadcasts.
+- Gradient through masking (in- or out-of-place) is identical: filled positions get 0 grad
+  (constant), unfilled pass through; after softmax the masked weights ~0 contribute nothing.
+- Full-row masks (all -inf) -> softmax NaN (0/0). Causal masks keep the diagonal so they're safe.
+
+## 13. In-place ops: the leaf rule & memory
+
+- **Cannot in-place-edit a LEAF that requires grad** (a Parameter, or `requires_grad=True` leaf):
+  raises "a leaf Variable that requires grad is being used in an in-place operation." The leaf is
+  the differentiation target; mutating it would corrupt backward. Do intentional edits under
+  `with torch.no_grad():` (that's how optimizer steps modify weights).
+- **Version-counter error**: an in-place op that overwrites a value some other op needs for its
+  backward raises at `.backward()` ("...modified by an inplace operation").
+- **Memory**: out-of-place (`scores = scores.masked_fill(...)`) allocates a NEW buffer — a
+  transient ~2x peak of THAT tensor (old freed once dereferenced), not permanent doubling.
+  In-place (`masked_fill_`) reuses the buffer.
+  - **Inference** (`torch.no_grad()`/`inference_mode()`): no graph -> in-place is safe and saves
+    the peak. Worth it for the quadratic `(seq,seq)` attention scores on long sequences.
+  - **Training**: prefer out-of-place — identical gradients, avoids version-counter footguns.
+  - Bigger memory wins come from fused kernels (FlashAttention) that never materialize full scores.
+
+## 14. matmul semantics & fuse-vs-batch
+
+- **`@` / `matmul` operate on the LAST TWO dims**; all leading dims are BATCH (broadcast).
+  So to matmul over axes A and B independently per "slice", arrange the tensor as
+  `(..., slice, A, B)` — matmul axes trailing, independent axes leading.
+- **`.mT` is a PROPERTY (no args)** — always swaps the last two dims. To swap arbitrary dims use
+  `.transpose(i, j)` (a method that takes args). `x.mT(-3,-2)` is a bug (`'Tensor' object is not
+  callable`).
+
+### Fuse (concat) vs batch — when to use which
+
+Litmus test: **is the dimension I want to merge the one being contracted (summed)?**
+
+- **Fuse into ONE big GEMM** when you concat along a NON-contracted dim and the contracted dim is
+  shared. E.g. QKV projection: same input `x` (shared contraction `d_in`), different weights
+  stacked along output -> `cat([Wq,Wk,Wv]) ; qkv = x @ W.T ; q,k,v = qkv.chunk(3,-1)`. Faster:
+  one kernel, fewer launches, `x` read once.
+- **Batch (independent dim -> leading axis)** when each slice has its OWN operands and you contract
+  a per-slice dim. E.g. attention scores `q_h @ k_hᵀ` contract `d_head` per head -> head must be a
+  batch axis. Concatenating heads here would SUM across heads (wrong).
+- **Never a Python `for` loop** over the slices: serial, many tiny kernel launches, no parallelism.
+  Batched matmul dispatches ONE strided-batched GEMM doing all slices in parallel.
+
+## 15. Splitting / merging dims (the multi-head pattern)
+
+`reshape`/`view` don't accept `...`; use one of these to split the LAST dim into sub-dims:
+
+```python
+q.unflatten(-1, (n_head, d_head))        # cleanest: split dim -1 -> (..., n_head, d_head)
+q.reshape(*q.shape[:-1], n_head, d_head) # unpack leading dims with *; or use -1 for one
+rearrange(q, '... s (h e) -> ... s h e', h=n_head)   # einops (allows ...)
+```
+
+- Merge sub-dims back: `x.flatten(-2)` (merge last two) or `x.reshape(*x.shape[:-2], d_m)`.
+- **Multi-head attention shape dance** (why the transpose is unavoidable):
+  ```
+  x                (..., seq, d_m)
+  project @ W.mT   (..., seq, d_m)
+  unflatten(-1)    (..., seq, n_head, d_head)   # head lands AFTER seq
+  transpose(-3,-2) (..., n_head, seq, d_head)   # move head to batch; (seq,d_head) trailing
+  attention        (..., n_head, seq, d_head)
+  transpose(-3,-2) (..., seq, n_head, d_head)   # move head back
+  flatten(-2)      (..., seq, d_m)              # concat heads
+  @ Wo.mT          (..., seq, d_m)
+  ```
+  The projection lays out head as a non-contracted dim (after seq), but the score matmul needs
+  head as a batch dim -> a transpose (or an equivalent `einsum`/`rearrange`) is unavoidable. It's
+  a cheap stride view; any downstream `.contiguous()` copy is minor.
+
+### flatten vs unflatten (asymmetric)
+
+| | operates on | arg | direction |
+|---|---|---|---|
+| `flatten(start_dim, end_dim=-1)` | a RANGE of dims | start/end indices | merge many -> 1 |
+| `unflatten(dim, sizes)` | ONE dim | the new size tuple | split 1 -> many |
+
+- `flatten` merges the contiguous range `start_dim..end_dim` (default `end_dim=-1` = last dim);
+  dims outside the range are untouched.
+  - `(5,3,2,1).flatten(-2)` -> `(5,3,2)`   (last 2)
+  - `(5,3,2,1).flatten(-3)` -> `(5,6)`      (last 3; leading 5 kept)
+  - `(5,3,2,1).flatten(1,2)` -> `(5,6,1)`   (merge dims 1..2 only)
+  - `(5,3,2,1).flatten()` -> `(30,)`        (no args = everything -> 1D)
+  - So `flatten(-3)` is NOT always `(6,)` — it depends on rank (only when the tensor is exactly 3-D).
+- `unflatten` splits ANY single dim (int, may be negative) into `sizes`; product of `sizes` must
+  equal that dim's size; one `-1` may be inferred; other dims untouched.
+  - `(6,12,8).unflatten(-1,(2,4))` -> `(6,12,2,4)`   (split last)
+  - `(6,12,8).unflatten(1,(3,4))`  -> `(6,3,4,8)`    (split middle)
+  - `(6,12,8).unflatten(0,(2,3))`  -> `(2,3,12,8)`   (split first)
+  - `(6,12,8).unflatten(1,(3,-1))` -> `(6,3,4,8)`    (-1 inferred)
+  - wrong product -> error (e.g. `unflatten(-1,(3,3))` on dim size 8).
+- They invert each other: `x.unflatten(dim, sizes).flatten(dim, dim+len(sizes)-1) == x` (shape).
+- Asymmetry reason: merging needs a *range* (which consecutive dims to fuse); splitting needs a
+  *single dim + target shape* (only one dim, but you must say into what). `unflatten` can't take a
+  range.

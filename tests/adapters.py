@@ -8,7 +8,20 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
-from cs336_basics.model import Linear, Embedding, RMSNorm, SwiGLU, SwiGLU2, RoPE
+from cs336_basics.model import (
+    Linear,
+    Embedding,
+    RMSNorm,
+    SwiGLU,
+    SwiGLU2,
+    RoPE,
+    softmax,
+    Attention1,
+    MHA,
+    MHA_full,
+    MyTransformer,
+    FullTransformer,
+)
 
 
 def run_linear(
@@ -88,7 +101,7 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    
+
     # swiglu = SwiGLU(d_model, d_ff)
     # swiglu.load_state_dict({"w1": w1_weight, "w2": w3_weight, "w3": w2_weight})
     # return swiglu(in_features)
@@ -96,7 +109,6 @@ def run_swiglu(
     swiglu = SwiGLU2(d_model, d_ff)
     swiglu.load_state_dict({"w1.weight": w1_weight, "w2.weight": w3_weight, "w3.weight": w2_weight})
     return swiglu(in_features)
-
 
 
 def run_scaled_dot_product_attention(
@@ -117,7 +129,8 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    a = Attention1()
+    return a(K, V, Q, mask)
 
 
 def run_multihead_self_attention(
@@ -151,7 +164,9 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    m = MHA(d_model, num_heads)
+    m.load_state_dict({"Wq": q_proj_weight, "Wk": k_proj_weight, "Wv": v_proj_weight, "Wo": o_proj_weight})
+    return m(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -191,7 +206,11 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    m = MHA_full(d_model, num_heads, max_seq_len, theta)
+    m.load_state_dict(
+        {"Lq.weight": q_proj_weight, "Lk.weight": k_proj_weight, "Lv.weight": v_proj_weight, "Lo.weight": o_proj_weight}
+    )
+    return m(in_features, token_positions)
 
 
 def run_rope(
@@ -213,7 +232,7 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    rope  = RoPE(d_k, theta, max_seq_len)
+    rope = RoPE(d_k, theta, max_seq_len)
     return rope(in_query_or_key, token_positions)
 
 
@@ -287,7 +306,21 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    m = MyTransformer(d_model, num_heads, max_seq_len, theta, d_ff)
+    weight_map = {
+        "attn.q_proj.weight": "mha.Lq.weight",
+        "attn.k_proj.weight": "mha.Lk.weight",
+        "attn.v_proj.weight": "mha.Lv.weight",
+        "attn.output_proj.weight": "mha.Lo.weight",
+        "ln1.weight": "norm1.g",
+        "ffn.w1.weight":"ffn.w1.weight",
+        "ffn.w2.weight":"ffn.w3.weight",
+        "ffn.w3.weight":"ffn.w2.weight",
+        "ln2.weight": "norm2.g",
+    }
+    mapped_w = {weight_map[k]:v for k,v in weights.items()}
+    m.load_state_dict(mapped_w)
+    return m(in_features)
 
 
 def run_transformer_lm(
@@ -369,8 +402,35 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    m = FullTransformer(vocab_size, num_layers, context_length, d_model, num_heads, rope_theta, d_ff)
+    weight_map = {
+        "attn.q_proj.weight": "mha.Lq.weight",
+        "attn.k_proj.weight": "mha.Lk.weight",
+        "attn.v_proj.weight": "mha.Lv.weight",
+        "attn.output_proj.weight": "mha.Lo.weight",
+        "ln1.weight": "norm1.g",
+        "ffn.w1.weight":"ffn.w1.weight",
+        "ffn.w2.weight":"ffn.w3.weight",
+        "ffn.w3.weight":"ffn.w2.weight",
+        "ln2.weight": "norm2.g",
+    }
+    map_else = {
+        "token_embeddings.weight":"embedding.weight",
+        "ln_final.weight":"norm.g",
+        "lm_head.weight":"lm_head.weight"
+    }
 
+    def name_t(key):
+        if key.startswith("layers."):
+            k = key.split(".", 2)
+            k[2] = weight_map[k[2]]
+            return ".".join(k)
+        else:
+            return map_else[key]
+
+    new_weights = {name_t(k):v for k,v in weights.items()}
+    m.load_state_dict(new_weights)
+    return m(in_indices)
 
 def run_rmsnorm(
     d_model: int,
@@ -395,6 +455,7 @@ def run_rmsnorm(
     n = RMSNorm(d_model, eps)
     n.load_state_dict({"g": weights})
     return n(in_features)
+
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
     """Given a tensor of inputs, return the output of applying SiLU
@@ -446,7 +507,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    return softmax(in_features, dim)
 
 
 def run_cross_entropy(
